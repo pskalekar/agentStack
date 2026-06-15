@@ -103,8 +103,16 @@ Keeping all USDC liquid is simplest but earns nothing — defeating the demo. Ke
 the vault maximizes yield but means every payment incurs a withdrawal (latency + gas).
 
 **Decision:** a **buffer**. Keep `BUFFER_USDC` liquid; sweep the excess; withdraw only when a
-payment would exceed the liquid balance, and withdraw `needed − liquid` (plus a small pad).
-This mirrors how a human treasurer keeps a checking-account float over a savings account.
+payment would exceed the liquid balance. This mirrors how a human treasurer keeps a
+checking-account float over a savings account. Two real-world caveats the implementation
+handles:
+- **Withdrawals can be liquidity-limited.** A lending vault's withdrawable amount
+  (`maxWithdraw`) can be *less than* the position value — even zero — if the underlying market
+  has no free liquidity. The agent caps every withdrawal at `maxWithdraw()` and fails loudly if
+  it still can't cover the cost, rather than reverting mid-transaction.
+- **Every write's receipt status is checked.** A reverted transaction still returns a receipt;
+  the agent treats `status !== 'success'` as an error so a failed deposit/withdraw/payment can
+  never be mistaken for a successful one.
 
 ### 3.5 Chain choice: Arc testnet
 
@@ -112,6 +120,32 @@ This mirrors how a human treasurer keeps a checking-account float over a savings
 same asset it manages, removing the "need a second token for fees" wrinkle that complicates the
 story on other chains. Arc is EVM-compatible, so the code is standard viem/ERC-4626 and could be
 pointed at another EVM testnet by changing config.
+
+### 3.6 Yield source: a permissionless ERC-4626 lending vault (chosen) vs. USYC
+
+The agent earns by supplying idle USDC to a **permissionless ERC-4626 vault** — concretely a
+Morpho USDC lending vault on Arc, where the yield comes from borrowers paying interest (reflected
+in the vault's share price).
+
+- **Rejected alternative: USYC** (a tokenized money-market fund redeemable to USDC). It's a
+  natural "earn" source, but access is **permissioned** — it requires KYC/AML and wallet
+  allowlisting, and uses a Teller mint/redeem flow rather than a permissionless `deposit`. A demo
+  meant to be cloned and run by anyone can't depend on that. The `EarnProvider` seam (§5.1) means
+  a `UsycEarnProvider` could be added later for that flavor without changing the agent loop, but
+  it would not be a drop-in (Teller + allowlist, not ERC-4626).
+- **Note:** any ERC-4626 USDC vault works by changing `VAULT_ADDRESS`; verify a candidate on the
+  block explorer (its `asset()` must equal the USDC address).
+
+### 3.7 Gas reserve: never spend to zero (Arc specifics)
+
+On Arc, USDC is *also* the native gas token, and the native balance and the ERC-20 USDC balance
+are the **same pool**. So the agent can never spend ~100% of its balance — sending the payment
+transaction deducts gas from the same USDC first, which would drop the balance below the transfer
+amount and revert.
+
+**Decision:** keep a small `GAS_RESERVE_USDC` on hand at all times. When paying, the agent targets
+`cost + gasReserve` liquid (withdrawing from the vault if needed), then pays the **exact cost** —
+never the whole balance — leaving the reserve to fund the transaction fee.
 
 ---
 
@@ -154,26 +188,31 @@ pointed at another EVM testnet by changing config.
 The single seam that keeps the yield source swappable:
 
 ```ts
-interface EarnPosition {
-  shares: bigint;        // vault shares held (vault decimals)
-  principal: bigint;     // USDC deposited, net of withdrawals (6 decimals)
+interface VaultPosition {
+  shares: bigint;        // vault shares held (vault decimals — may differ from USDC)
   currentValue: bigint;  // convertToAssets(shares), in USDC base units
-  yieldAccrued: bigint;  // currentValue - principal, in USDC base units (may be 0)
 }
 
 interface EarnProvider {
   /** Deposit USDC (6-decimal base units) into the yield source. */
-  deposit(amountUSDC: bigint): Promise<{ txHash: string }>;
+  deposit(amountUSDC: bigint): Promise<{ txHash: Hash }>;
   /** Withdraw USDC (6-decimal base units) back to the wallet. */
-  withdraw(amountUSDC: bigint): Promise<{ txHash: string }>;
-  /** Current position, all amounts in USDC base units. */
-  position(): Promise<EarnPosition>;
+  withdraw(amountUSDC: bigint): Promise<{ txHash: Hash }>;
+  /** Max USDC currently withdrawable for this account (liquidity-limited). */
+  maxWithdraw(): Promise<bigint>;
+  /** Current on-chain position. */
+  position(): Promise<VaultPosition>;
 }
 ```
 
 `MorphoVaultProvider` implements this against an ERC-4626 vault: `deposit` calls the vault's
 `deposit(assets, receiver)`; `withdraw` calls `withdraw(assets, receiver, owner)`; `position`
-reads `balanceOf` + `convertToAssets`. All decimal conversions are isolated here.
+reads `balanceOf` + `convertToAssets`; `maxWithdraw` reads the vault's withdrawable amount. All
+decimal conversions are isolated here, and every write checks its receipt status (§3.4).
+
+`position()` deliberately returns only **on-chain truth** (shares + current value). *Principal*
+and *realized yield* are app-level concepts — derived from the agent's own deposit/withdraw
+history, not something the vault knows — so they live in the agent layer, not the provider.
 
 ### 5.2 The agent loop
 
@@ -189,10 +228,14 @@ loop every TICK_SECONDS:
     # If there's work that costs money this tick:
     if task.pending and task.costUSDC > 0:
         liquid = usdc.balanceOf(wallet)          # re-read
+        target = task.costUSDC + GAS_RESERVE     # keep gas headroom (USDC = gas on Arc)
+        if liquid < target:
+            shortfall = target - liquid
+            earn.withdraw(min(shortfall, earn.maxWithdraw()))   # liquidity-capped
+            liquid = usdc.balanceOf(wallet)
         if liquid < task.costUSDC:
-            shortfall = task.costUSDC - liquid
-            earn.withdraw(shortfall + WITHDRAW_PAD)
-        paymentLeg.pay(task)                      # Nanopayments / x402
+            raise "cannot cover task"            # fail loudly, never underpay silently
+        paymentLeg.pay(task.costUSDC)            # pay EXACT cost; reserve funds gas
         emit("paid", task)
 
     emit("tick", { liquid, position })
