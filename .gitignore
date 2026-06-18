@@ -11,6 +11,14 @@
 # Node
 node_modules/
 .next/
+next-env.d.ts
 out/
 dist/
 *.log
+
+# Agent runtime
+.data/
+tsconfig.tsbuildinfo
+
+# Personal faucet automation — machine-specific, not part of the demo
+/auto-invest-agent/scripts/

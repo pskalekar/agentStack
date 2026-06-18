@@ -16,6 +16,7 @@ import { config, explorerTx } from '../config'
 import { MorphoVaultProvider } from '../earn/MorphoVaultProvider'
 import { TransferPaymentLeg } from '../pay/TransferPaymentLeg'
 import { AutoInvestAgent, type Snapshot } from '../agent/AutoInvestAgent'
+import { appendEvent } from '../events'
 
 const D = 6
 const usdc = (n: bigint) => `${formatUnits(n, D)} USDC`
@@ -51,19 +52,21 @@ async function main() {
   const vaultAddr = getAddress(config.vaultAddress)
   const payee = getAddress(config.payeeAddress)
   const buffer = parseUnits(config.bufferUsdc, D)
+  const lowWater = parseUnits(config.lowWaterUsdc, D)
   const taskCost = parseUnits(config.taskCostUsdc, D)
   const gasReserve = parseUnits(config.gasReserveUsdc, D)
+  const tasks = config.demoTasks
 
   console.log('=== Auto-Invest Agent — demo ===')
   console.log(`Chain:  ${chain.name} (${chain.id})`)
   console.log(`Agent:  ${account.address}`)
   console.log(`Vault:  ${vaultAddr}`)
   console.log(`Payee:  ${payee}`)
-  console.log(`Policy: keep ${usdc(buffer)} liquid; a task costs ${usdc(taskCost)}\n`)
+  console.log(`Policy: ${config.bufferTasks}-task buffer (~${usdc(buffer)}); each task ~${usdc(taskCost)} + ~${usdc(gasReserve)} gas; refill from vault when liquid < ${config.lowWaterTasks} tasks (~${usdc(lowWater)})\n`)
 
   const earn = new MorphoVaultProvider({ publicClient, walletClient, account, vaultAddress: vaultAddr, usdcAddress: usdcAddr })
   const pay = new TransferPaymentLeg({ publicClient, walletClient, account, usdcAddress: usdcAddr, payee })
-  const agent = new AutoInvestAgent({ publicClient, account, usdcAddress: usdcAddr, earn, pay, bufferUSDC: buffer, gasReserveUSDC: gasReserve })
+  const agent = new AutoInvestAgent({ publicClient, account, usdcAddress: usdcAddr, earn, pay, bufferUSDC: buffer, lowWaterUSDC: lowWater, gasReserveUSDC: gasReserve })
 
   const nativeBal = await publicClient.getBalance({ address: account.address })
   if (nativeBal === 0n) {
@@ -85,26 +88,30 @@ async function main() {
   const swept = await agent.sweepIdle()
   if (swept.swept > 0n) {
     console.log(`  invested ${usdc(swept.swept)}  →  ${explorerTx(swept.txHash!)}`)
+    appendEvent({ type: 'sweep', amountUSDC: formatUnits(swept.swept, D), txHash: swept.txHash!, at: Date.now() })
   } else {
     console.log('  nothing to sweep (liquid already at/below buffer)')
   }
   showSnapshot('after sweep:', await agent.snapshot())
 
-  // Step 2 — a paid task arrives
-  console.log(`\nStep 2 — task arrives: pay ${usdc(taskCost)} for "premium data API call"`)
-  const result = await agent.payForTask(taskCost, 'premium data API call')
-  if (result.withdrew > 0n) {
-    console.log(`  liquid was short — withdrew ${usdc(result.withdrew)} from vault  →  ${explorerTx(result.withdrawTx!)}`)
-  } else {
-    console.log('  covered from liquid balance (no withdrawal needed)')
+  // Step 2 — a stream of paid tasks. Pay from the buffer; refill only when low.
+  console.log(`\nStep 2 — run ${tasks} paid tasks (each ${usdc(taskCost)}); refill from the vault only when the buffer runs low`)
+  let refills = 0
+  for (let i = 1; i <= tasks; i++) {
+    const result = await agent.payForTask(taskCost, 'premium data API call')
+    if (result.refilled > 0n) {
+      refills++
+      console.log(`  • buffer low → refilled ${usdc(result.refilled)} from vault  →  ${explorerTx(result.refillTx!)}`)
+      appendEvent({ type: 'withdraw', amountUSDC: formatUnits(result.refilled, D), txHash: result.refillTx!, at: Date.now() })
+    }
+    console.log(`  task ${i}/${tasks}: paid ${usdc(result.payment.paidUSDC)}  →  ${explorerTx(result.payment.txHash)}`)
+    appendEvent({ type: 'pay', amountUSDC: formatUnits(result.payment.paidUSDC, D), to: result.payment.to, memo: 'premium data API call', txHash: result.payment.txHash, at: Date.now() })
   }
-  console.log(`  paid ${usdc(result.payment.paidUSDC)} to payee  →  ${explorerTx(result.payment.txHash)}`)
 
   // Step 3 — final position
   console.log('\nStep 3 — final position')
   showSnapshot('now:', await agent.snapshot())
-
-  console.log('\n✓ Demo complete: idle USDC was invested, then partially redeemed just-in-time to pay for a service.')
+  console.log(`\n✓ Demo complete: invested idle USDC, paid ${tasks} tasks from the buffer with only ${refills} refill${refills === 1 ? '' : 's'} from the vault.`)
 }
 
 main().catch((err) => {

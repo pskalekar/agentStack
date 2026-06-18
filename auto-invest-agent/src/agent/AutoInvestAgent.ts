@@ -9,8 +9,11 @@ export interface AutoInvestAgentOpts {
   usdcAddress: Address
   earn: EarnProvider
   pay: PaymentLeg
-  /** Liquid USDC to keep un-invested, in base units (6 decimals). */
+  /** High-water liquid target (the buffer), in base units (6 decimals). */
   bufferUSDC: bigint
+  /** Low-water refill trigger, in base units. When liquid drops below this, the
+   * agent refills back up to the buffer in one withdrawal. */
+  lowWaterUSDC: bigint
   /**
    * USDC to keep on hand for gas, in base units. On Arc, gas is paid in USDC
    * from the same balance, so the agent must never spend down to zero — it
@@ -26,8 +29,8 @@ export interface Snapshot {
 }
 
 export interface PayForTaskResult {
-  withdrew: bigint
-  withdrawTx?: Hash
+  refilled: bigint
+  refillTx?: Hash
   payment: PaymentResult
 }
 
@@ -43,6 +46,7 @@ export class AutoInvestAgent {
   private readonly earn: EarnProvider
   private readonly payLeg: PaymentLeg
   private readonly buffer: bigint
+  private readonly lowWater: bigint
   private readonly gasReserve: bigint
 
   constructor(o: AutoInvestAgentOpts) {
@@ -52,6 +56,7 @@ export class AutoInvestAgent {
     this.earn = o.earn
     this.payLeg = o.pay
     this.buffer = o.bufferUSDC
+    this.lowWater = o.lowWaterUSDC
     this.gasReserve = o.gasReserveUSDC
   }
 
@@ -76,39 +81,40 @@ export class AutoInvestAgent {
   }
 
   /**
-   * Pay `costUSDC` for a task. The agent wants `cost + gasReserve` liquid before
-   * paying (so it can pay the full amount AND afford gas — gas is USDC on Arc).
-   * If short, it withdraws the difference from the vault (capped at what's
-   * actually withdrawable). It pays the EXACT cost — never the whole balance —
-   * and throws if it genuinely cannot cover the cost.
+   * Pay `costUSDC` for a task, mostly from the liquid buffer.
+   *
+   * When liquid drops below the configured low-water (≈ N tasks of cost+gas), the
+   * agent refills back up to the BUFFER (high-water) in one withdrawal — so a
+   * single redemption covers many subsequent tasks, instead of redeeming every
+   * task. Pays the EXACT cost (never the whole balance); keeps a gas reserve so
+   * the payment tx can always afford its fee; throws if it genuinely can't cover.
    */
   async payForTask(costUSDC: bigint, memo?: string): Promise<PayForTaskResult> {
-    const target = costUSDC + this.gasReserve
     let liquid = await this.liquid()
-    let withdrew = 0n
-    let withdrawTx: Hash | undefined
+    let refilled = 0n
+    let refillTx: Hash | undefined
 
-    if (liquid < target) {
-      const shortfall = target - liquid
+    if (liquid < this.lowWater) {
+      const need = this.buffer - liquid
       const available = await this.earn.maxWithdraw()
-      const toWithdraw = shortfall < available ? shortfall : available
+      const toWithdraw = need < available ? need : available
       if (toWithdraw > 0n) {
         const res = await this.earn.withdraw(toWithdraw)
-        withdrew = toWithdraw
-        withdrawTx = res.txHash
+        refilled = toWithdraw
+        refillTx = res.txHash
         liquid = await this.liquid()
       }
     }
 
-    if (liquid < costUSDC) {
+    if (liquid < costUSDC + this.gasReserve) {
       throw new Error(
-        `Cannot cover task: need ${costUSDC} (base units) liquid but only have ${liquid}; ` +
+        `Cannot cover task: need ${costUSDC} + gas liquid but only have ${liquid}; ` +
         `the vault could not supply the rest (maxWithdraw exhausted).`,
       )
     }
 
     // Pay exactly the cost; the gas reserve stays behind to fund the tx fee.
     const payment = await this.payLeg.pay(costUSDC, memo)
-    return { withdrew, withdrawTx, payment }
+    return { refilled, refillTx, payment }
   }
 }

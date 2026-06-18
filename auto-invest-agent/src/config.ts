@@ -5,6 +5,28 @@ function opt(name: string, fallback: string): string {
   return v === undefined || v === '' ? fallback : v
 }
 
+// Policy knobs. The agent sizes its liquid float in TASKS, where each task's
+// all-in cost is the payment PLUS gas (gas is paid in USDC on Arc, same balance).
+//   per-task    = TASK_COST_USDC + GAS_PER_TASK_USDC
+//   buffer      = BUFFER_TASKS    × per-task   (high-water target liquid)
+//   low-water   = LOW_WATER_TASKS × per-task   (refill trigger)
+const taskCostUsdc = opt('TASK_COST_USDC', '0.1')
+const gasPerTaskUsdc = opt('GAS_PER_TASK_USDC', '0.01')
+const bufferTasks = Number(opt('BUFFER_TASKS', '10'))
+const lowWaterTasks = Number(opt('LOW_WATER_TASKS', '5'))
+
+/** Derive absolute USDC amounts from the task-count knobs. Pure + testable. */
+export function derivePolicy(taskCost: string, gasPerTask: string, bufTasks: number, lowTasks: number) {
+  const perTask = Number(taskCost) + Number(gasPerTask)
+  return {
+    perTaskUsdc: perTask.toFixed(6),
+    bufferUsdc: (perTask * bufTasks).toFixed(6),
+    lowWaterUsdc: (perTask * lowTasks).toFixed(6),
+  }
+}
+
+const { perTaskUsdc, bufferUsdc, lowWaterUsdc } = derivePolicy(taskCostUsdc, gasPerTaskUsdc, bufferTasks, lowWaterTasks)
+
 export const config = {
   rpcUrl: opt('RPC_URL', 'https://rpc.testnet.arc.network'),
   chainId: Number(opt('CHAIN_ID', '5042002')),
@@ -12,14 +34,27 @@ export const config = {
   usdcAddress: opt('USDC_ADDRESS', '0x3600000000000000000000000000000000000000') as `0x${string}`,
   vaultAddress: (process.env.VAULT_ADDRESS ?? '') as `0x${string}`,
   privateKey: process.env.AGENT_PRIVATE_KEY ?? '',
-  bufferUsdc: opt('BUFFER_USDC', '2'),
+
+  // --- Agent policy ---
+  taskCostUsdc, // approximate cost per task
+  gasPerTaskUsdc, // gas headroom per task (gas is USDC on Arc)
+  bufferTasks, // high-water float, in tasks
+  lowWaterTasks, // refill trigger, in tasks
+  perTaskUsdc, // derived: task + gas
+  bufferUsdc, // derived: bufferTasks × per-task
+  lowWaterUsdc, // derived: lowWaterTasks × per-task
+  gasReserveUsdc: gasPerTaskUsdc, // pay-time gas floor (= one task's gas)
   tickSeconds: Number(opt('TICK_SECONDS', '15')),
-  verifyAmountUsdc: opt('VERIFY_AMOUNT_USDC', '1'),
-  // demo: where a "service payment" is sent, and how much a task costs.
+
+  // --- verify-earn ---
+  verifyAmountUsdc: opt('VERIFY_AMOUNT_USDC', '0.1'),
+
+  // --- demo ---
   payeeAddress: (process.env.PAYEE_ADDRESS ?? '') as `0x${string}`,
-  taskCostUsdc: opt('TASK_COST_USDC', '4'),
-  // USDC kept on hand for gas (gas is paid in USDC on Arc).
-  gasReserveUsdc: opt('GAS_RESERVE_USDC', '0.05'),
+  demoTasks: Number(opt('DEMO_TASKS', '12')),
+
+  // --- dashboard ---
+  agentAddress: (process.env.AGENT_ADDRESS ?? '') as `0x${string}`,
 }
 
 export function explorerTx(hash: string): string {
