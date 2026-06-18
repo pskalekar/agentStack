@@ -5,7 +5,7 @@
 > It runs on **testnet only**, uses no real funds, and is not intended for production use
 > without modification.
 
-**Author:** pskalekar · **Status:** Draft · **Date:** 2026-06-15
+**Author:** pskalekar · **Status:** Draft · **Date:** 2026-06-18
 
 ---
 
@@ -97,15 +97,25 @@ every chain or testnet.
 (`convertToAssets(shares)` over time) since the agent's first deposit. Any headline APY shown is
 clearly labeled **illustrative**. We never fabricate a precise yield number.
 
-### 3.4 Just-in-time withdrawal vs. keeping everything liquid
+### 3.4 Sizing the buffer: a working float in *tasks*, refilled occasionally
 
-Keeping all USDC liquid is simplest but earns nothing — defeating the demo. Keeping everything in
-the vault maximizes yield but means every payment incurs a withdrawal (latency + gas).
+Keeping all USDC liquid is simplest but earns nothing. Keeping everything in the vault maximizes
+yield but means every payment incurs a withdrawal (latency + gas). And sizing the buffer as a
+*fraction* of a task is worst of all — every task would trigger a redemption.
 
-**Decision:** a **buffer**. Keep `BUFFER_USDC` liquid; sweep the excess; withdraw only when a
-payment would exceed the liquid balance. This mirrors how a human treasurer keeps a
-checking-account float over a savings account. Two real-world caveats the implementation
-handles:
+**Decision:** a **two-threshold working float, sized in tasks**, where each task's all-in cost is
+its payment **plus gas** (`per-task = TASK_COST_USDC + GAS_PER_TASK_USDC`):
+- **High-water (buffer)** = `BUFFER_TASKS × per-task` — the liquid target. `sweepIdle` invests
+  everything above it.
+- **Low-water (refill trigger)** = `LOW_WATER_TASKS × per-task`. When liquid drops below it, the
+  agent **refills back up to the high-water buffer in a single withdrawal**.
+
+So most tasks are paid straight from liquid, and a redemption happens only every
+`(BUFFER_TASKS − LOW_WATER_TASKS)` tasks or so — redeeming is the exception, not the rule. This
+mirrors a treasurer keeping a checking-account float over a savings account, and it makes the
+buffer auto-scale: change the task cost and the absolute thresholds move with it.
+
+Two real-world caveats the implementation handles:
 - **Withdrawals can be liquidity-limited.** A lending vault's withdrawable amount
   (`maxWithdraw`) can be *less than* the position value — even zero — if the underlying market
   has no free liquidity. The agent caps every withdrawal at `maxWithdraw()` and fails loudly if
@@ -143,9 +153,11 @@ are the **same pool**. So the agent can never spend ~100% of its balance — sen
 transaction deducts gas from the same USDC first, which would drop the balance below the transfer
 amount and revert.
 
-**Decision:** keep a small `GAS_RESERVE_USDC` on hand at all times. When paying, the agent targets
-`cost + gasReserve` liquid (withdrawing from the vault if needed), then pays the **exact cost** —
-never the whole balance — leaving the reserve to fund the transaction fee.
+**Decision:** gas is treated as part of every task's cost. The per-task unit used for buffer
+sizing (§3.4) is `TASK_COST_USDC + GAS_PER_TASK_USDC`, so the buffer and low-water inherently
+carry gas headroom for the tasks they cover. On top of that, each payment keeps a gas-reserve
+floor (one task's gas) and pays the **exact cost** — never the whole balance — so the payment tx
+can always afford its own fee. The agent throws rather than paying if it can't keep that floor.
 
 ---
 
@@ -161,8 +173,8 @@ never the whole balance — leaving the reserve to fund the transaction fee.
         ▼                      ▼                     ▼                   ▼
  ┌─────────────┐      ┌─────────────────┐    ┌──────────────┐   ┌────────────────┐
  │ Agent wallet │      │  EarnProvider    │    │  PaymentLeg  │   │   Dashboard    │
- │   (USDC)     │      │ (ERC-4626 vault  │    │ (Nanopayments│   │  (Next.js, RO) │
- │              │      │   via viem)      │    │  / x402 CLI) │   │                │
+ │   (USDC)     │      │ (ERC-4626 vault  │    │ (USDC xfer;  │   │  (Next.js, RO) │
+ │              │      │   via viem)      │    │  x402 next)  │   │                │
  └──────┬───────┘      └────────┬─────────┘    └──────┬───────┘   └───────┬────────┘
         │                       │                     │                   │
         ▼                       ▼                     ▼                   ▼
@@ -176,8 +188,8 @@ never the whole balance — leaving the reserve to fund the transaction fee.
 |---|---|
 | **Agent process** | Runs the loop: read balances, sweep, withdraw-on-demand, pay, emit events. |
 | **EarnProvider** | Abstraction over the yield source. Default impl: `MorphoVaultProvider` (ERC-4626 via viem). |
-| **PaymentLeg** | Pays for a service using the Circle CLI's Nanopayments / x402 support. |
-| **Dashboard** | Read-only Next.js view of liquid vs. earning balance, realized yield, runway, event log. |
+| **PaymentLeg** | Pays for a service. Default impl: `TransferPaymentLeg` (USDC transfer); `X402PaymentLeg` (Nanopayments / x402) is future work behind the same interface. |
+| **Dashboard** | Read-only Next.js view of liquid vs. earning balance, runway, and the activity feed. |
 
 ---
 
@@ -216,50 +228,58 @@ history, not something the vault knows — so they live in the agent layer, not 
 
 ### 5.2 The agent loop
 
+Both thresholds are absolute USDC, derived from the task-count knobs:
+`BUFFER = BUFFER_TASKS × per-task` and `LOW_WATER = LOW_WATER_TASKS × per-task`,
+where `per-task = TASK_COST_USDC + GAS_PER_TASK_USDC` (§3.4).
+
 ```
-loop every TICK_SECONDS:
-    liquid   = usdc.balanceOf(wallet)            # 6-decimal base units
-    position = earn.position()
+# sweepIdle(): invest everything above the buffer
+liquid = usdc.balanceOf(wallet)
+if liquid > BUFFER:
+    earn.deposit(liquid - BUFFER)
 
-    # Sweep idle funds into yield
-    if liquid > BUFFER_USDC + DUST:
-        earn.deposit(liquid - BUFFER_USDC)
-
-    # If there's work that costs money this tick:
-    if task.pending and task.costUSDC > 0:
-        liquid = usdc.balanceOf(wallet)          # re-read
-        target = task.costUSDC + GAS_RESERVE     # keep gas headroom (USDC = gas on Arc)
-        if liquid < target:
-            shortfall = target - liquid
-            earn.withdraw(min(shortfall, earn.maxWithdraw()))   # liquidity-capped
-            liquid = usdc.balanceOf(wallet)
-        if liquid < task.costUSDC:
-            raise "cannot cover task"            # fail loudly, never underpay silently
-        paymentLeg.pay(task.costUSDC)            # pay EXACT cost; reserve funds gas
-        emit("paid", task)
-
-    emit("tick", { liquid, position })
+# payForTask(cost): pay from the buffer; refill only when low
+liquid = usdc.balanceOf(wallet)
+if liquid < LOW_WATER:                                  # refill is the exception
+    earn.withdraw(min(BUFFER - liquid, earn.maxWithdraw()))   # refill to high-water, liquidity-capped
+    liquid = usdc.balanceOf(wallet)
+if liquid < cost + GAS_RESERVE:
+    raise "cannot cover task"                           # vault dry; fail loudly, never underpay
+paymentLeg.pay(cost)                                    # pay EXACT cost; gas reserve stays behind
 ```
 
-**State the agent persists** (local JSON or SQLite, for restart safety): cumulative principal
-deposited, list of payments made, last processed tick. On restart it re-reads on-chain balances
-and resumes — on-chain state is the source of truth; local state is only for history/runway.
+Because a refill tops liquid back up to the high-water buffer (not just enough for one task), a
+single withdrawal covers many subsequent tasks — redemption fires roughly every
+`BUFFER_TASKS − LOW_WATER_TASKS` tasks, not every task.
+
+**Activity log.** The agent appends each sweep / refill / payment (amount + tx hash) to a local
+`events.json` that the dashboard reads. Balances are always read live from chain (the source of
+truth); the log is only history for the feed and runway. Full restart-resume (replaying state on
+crash) is future work — see §9.
 
 ### 5.3 Payment leg
 
-Payments use the Circle CLI's Nanopayments / x402 support to call a real paid service
-(discovered via the marketplace `search`/`inspect`/`pay` flow). The `PaymentLeg` shells out to
-the CLI (or its SDK equivalent) and records the result. For the demo, the "service" is any small
-paid endpoint — the payment is the point, not the response.
+`PaymentLeg` is the swappable seam for "pay for a service." The shipped implementation,
+`TransferPaymentLeg`, makes a real USDC ERC-20 transfer to a payee — a faithful stand-in for a
+metered service charge (the payment is the point, not a response). A future `X402PaymentLeg`
+implements the same interface using the Circle CLI's Nanopayments / x402 support (discover via
+the marketplace `search`/`inspect`/`pay` flow) — no change to the agent loop.
 
 ### 5.4 Dashboard
 
-A read-only Next.js app polling the agent's event/state file:
+A read-only **Next.js** app (`npm run dashboard`, port 3007):
 
-- **Liquid vs. earning** — two numbers + a bar.
-- **Realized yield** — `currentValue − principal`, derived from share price (see §3.3).
-- **Runway** — `(liquid + currentValue) / average_burn_per_period`.
-- **Event log** — sweeps, withdrawals, payments, each with a tx hash linking to the explorer.
+- **Cards** — Total balance, Liquid (spendable), Earning (invested), and **Runway** (how many
+  more tasks it can fund).
+- **Split bar** — liquid vs. earning at a glance.
+- **Activity feed** — every sweep, refill, and payment, each with a tx link to the explorer.
+- **`/api/state`** reads balances **live from chain** every few seconds; **`/api/events`** reads
+  the activity log (§5.2).
+
+Implementation note: Next.js patches global `fetch` with caching, and viem's RPC transport uses
+`fetch` — so the on-chain reads must opt out (`cache: 'no-store'` + `fetchCache = 'force-no-store'`)
+or the dashboard shows stale balances. Realized yield is intentionally **not** shown as a headline
+number (see §3.3): on a test vault that doesn't accrue, it would read ~0, and we don't fabricate.
 
 ---
 
@@ -274,8 +294,16 @@ safe placeholders; `.env` is git-ignored.
 | `AGENT_PRIVATE_KEY` | Testnet wallet key (testnet funds only — never a real key). |
 | `USDC_ADDRESS` | USDC token address on the target chain. |
 | `VAULT_ADDRESS` | ERC-4626 yield vault address (find/verify one on the block explorer). |
-| `BUFFER_USDC` | Liquid balance to keep un-swept. |
-| `TICK_SECONDS` | Loop interval. |
+| `TASK_COST_USDC` | Approximate cost per task. |
+| `GAS_PER_TASK_USDC` | Gas headroom per task (gas is USDC on Arc). |
+| `BUFFER_TASKS` | High-water buffer, **in tasks** → `buffer = BUFFER_TASKS × (task + gas)`. |
+| `LOW_WATER_TASKS` | Low-water refill trigger, **in tasks**. |
+| `PAYEE_ADDRESS` | Demo: recipient of the stand-in service payment. |
+| `DEMO_TASKS` | Demo: how many tasks to run. |
+| `AGENT_ADDRESS` | Dashboard: account to display (optional; derived from the key otherwise). |
+
+The buffer and low-water are **derived** from the task counts, so they auto-scale with the task
+cost. Small defaults (task `0.1`, buffer `10` tasks, low-water `5` tasks) keep demos cheap.
 
 > Find and verify a vault by inspecting candidate ERC-4626 contracts on the public block
 > explorer (`asset()` should return the USDC address; `totalAssets()` should be non-zero). The
@@ -285,19 +313,25 @@ safe placeholders; `.env` is git-ignored.
 
 ## 7. Testing & Verification
 
-The riskiest part is the on-chain earn leg, so it's verified first and independently:
+Three layers, cheapest first:
 
-1. **`verify-earn` script** — against the configured vault on testnet: read `asset()`,
-   `decimals()`, `totalAssets()`; deposit a small amount; assert `position()` reflects it;
-   withdraw; assert funds return. No HTTP server needed.
-2. **Decimals roundtrip test** — deposit X USDC, read back `currentValue`, assert it matches X
-   within rounding, proving the shares↔assets conversion (§3.2) is correct.
-3. **Loop dry-run** — with a stub `PaymentLeg`, confirm sweep and just-in-time withdrawal fire
-   at the right thresholds.
-4. **Restart recovery** — kill the agent mid-run, restart, confirm it re-reads on-chain state
-   and resumes without double-counting principal.
-5. **End-to-end** — fund from the faucet → run the agent → observe a real deposit, a real
-   just-in-time withdrawal, and a real payment, each verifiable on the explorer.
+1. **Unit suite (`npm test`, Vitest)** — no chain, no funds, runs in ~0.5s. Covers the logic
+   where bugs actually occur:
+   - `AutoInvestAgent` — sweep above buffer; refill-to-buffer only below low-water (with the
+     `== buffer` / `== low-water` boundaries); `maxWithdraw` cap; exact-cost payment; the
+     gas-reserve guard (isolated: liquid between `cost` and `cost + reserve` must throw); and a
+     multi-task **cadence invariant** (refill ⟺ below low-water; never overspends; not every task).
+   - `MorphoVaultProvider` — the **18-dec shares → 6-dec USDC** conversion (§3.2); approve-then-
+     deposit / skip-approve; `withdraw(assets, receiver, owner)`; and **revert → throws** (the
+     receipt-status guard, §3.4).
+   - `TransferPaymentLeg` and `confirm()` — exact-amount transfer, and **revert → throws** (the
+     false-success regression guard).
+   - `derivePolicy` — the task-count → USDC sizing math.
+2. **`verify-earn` script** — against the configured vault on testnet: reads `asset()` /
+   `decimals()` / `totalAssets()`, deposits a small amount, asserts `position()` reflects it,
+   withdraws, asserts funds return. Proves the real on-chain earn leg.
+3. **`demo` script (end-to-end)** — fund from the faucet → run N tasks → observe real deposit,
+   real refill, and real payments, each verifiable on the explorer.
 
 ---
 
@@ -316,10 +350,15 @@ This demo:
 
 ## 9. Limitations & Future Work
 
-- **Trivial allocation policy.** Buffer + sweep only. A real treasury would consider gas cost of
-  rebalancing, expected burn, multiple vaults, and risk limits.
+- **Trivial allocation policy.** Buffer + sweep + low-water refill only. A real treasury would
+  consider the gas cost of rebalancing, forecast burn, multiple vaults, and risk limits.
+- **Payment leg is a stand-in.** `TransferPaymentLeg` sends a USDC transfer; the real
+  Nanopayments / x402 leg (`X402PaymentLeg`) is future work behind the same interface (§5.3).
+- **No restart-resume yet.** The agent re-reads live balances, but does not replay in-flight
+  state across a crash mid-operation. The activity log is history only.
 - **Single vault.** No diversification or APY comparison across sources.
-- **Yield reporting is realized-only.** No forward APY projection (deliberate — see §3.3).
+- **Yield reporting is realized-only.** No forward APY projection (deliberate — see §3.3); on a
+  non-accruing test vault it reads ~0.
 - **Withdrawal latency/gas not optimized.** Each just-in-time withdrawal is a transaction; a
   production version would batch or pre-position liquidity.
 - **Swappable earn source.** The `EarnProvider` seam means a different yield backend (another

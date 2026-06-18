@@ -3,7 +3,7 @@
 > **Personal exploration — not an official Circle product or endorsed sample.**
 > A demo of one way a developer *could* build with the Circle Agent Stack. Testnet only.
 
-**Status:** Draft · **Date:** 2026-06-15
+**Status:** Draft · **Date:** 2026-06-18
 
 ---
 
@@ -38,25 +38,33 @@ just-in-time liquidation → payment, all driven by the agent on its own.
 
 ## The loop
 
+The buffer is sized as a **number of tasks** (each task = its payment + gas), so most tasks are
+paid straight from liquid and the agent only redeems *occasionally* to top back up:
+
 ```
-        ┌─────────────────────────────────────────────────────────┐
-        │  1. Hold USDC in the agent wallet (keep a small buffer)   │
-        │  2. Sweep balance above the buffer into the yield vault   │
-        │  3. Agent needs to pay for a service                      │
-        │  4. Short on liquid USDC? Withdraw just enough from vault │
-        │  5. Pay via Nanopayments / x402                           │
-        │  └──────────────────────── repeat ────────────────────────┘
+        ┌──────────────────────────────────────────────────────────────┐
+        │  1. Hold USDC; keep a liquid buffer ≈ N tasks (cost + gas)     │
+        │  2. Sweep balance above the buffer into the yield vault        │
+        │  3. Pay each task straight from the buffer                     │
+        │  4. When liquid drops to ≈ M tasks, refill from the vault once │
+        │  5. Pay via Nanopayments / x402  (demo: a USDC transfer)       │
+        │  └────────────────────────── repeat ───────────────────────────┘
 ```
 
-While it runs, a small dashboard shows: **liquid balance vs. earning balance**, **yield
-accrued so far**, and **runway** (how long the agent can keep paying at its current burn).
+Refilling is the **exception, not the rule** — one withdrawal covers many tasks, so the agent
+rarely pays the latency/gas of a redemption.
+
+A live **dashboard** shows **liquid vs. earning balance**, **runway** (how many more tasks it can
+fund), and an **activity feed** of every sweep, refill, and payment with on-chain links.
 
 ## What it demonstrates
 
 - An agent can treat its wallet as a managed treasury, not a static balance.
 - Earning and spending compose cleanly when the earn leg sits behind a simple interface.
-- The whole thing runs against **real testnet contracts** — real deposits, real withdrawals,
-  real on-chain yield — not mocks.
+- A working float sized in *tasks* keeps redemptions occasional — yield without paying a
+  withdrawal on every payment.
+- The whole thing runs against **real testnet contracts** — real deposits, withdrawals, and
+  payments — not mocks, and is covered by a unit-test suite for the buffer/refill/gas logic.
 
 ## What it is *not*
 
@@ -64,10 +72,15 @@ accrued so far**, and **runway** (how long the agent can keep paying at its curr
 - Not production-ready. Testnet only, no real funds, secrets via environment variables.
 - Not an official integration — it talks to a yield vault directly via standard ERC-4626 calls.
 
-## Try it (once built)
+## Try it
 
-1. Get testnet USDC from the [Circle faucet](https://faucet.circle.com).
-2. Configure your wallet, the vault address, and a liquid buffer in `.env`.
-3. Run the agent and watch idle USDC move into yield and back out to pay for a service.
+1. `npm install`, then `cp .env.example .env`.
+2. Set your testnet key, a vault address, and a payee in `.env`; get testnet USDC from the
+   [Circle faucet](https://faucet.circle.com). Tune the policy via `TASK_COST_USDC`,
+   `BUFFER_TASKS`, and `LOW_WATER_TASKS`.
+3. `npm run demo` — watch the agent invest idle USDC, pay tasks from the buffer, and refill once
+   the buffer runs low (each step prints an explorer link).
+4. `npm run dashboard` — open the live view at `http://localhost:3007`.
+5. `npm test` — run the unit suite (no chain, no funds needed).
 
 See [`auto-invest-agent-design.md`](./auto-invest-agent-design.md) for the architecture and design decisions.
