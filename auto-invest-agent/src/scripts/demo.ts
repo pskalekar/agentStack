@@ -3,20 +3,19 @@
  *
  *   1. Show the agent's starting position.
  *   2. Sweep idle USDC (above the buffer) into the yield vault.
- *   3. A task arrives that costs USDC — the agent withdraws just enough, then pays.
+ *   3. Run a stream of paid tasks — pay from the buffer, refill from the vault
+ *      only when the buffer runs low.
  *   4. Show the final position.
  *
- * Everything is real on-chain: real deposit, real just-in-time withdrawal, real
- * payment (a USDC transfer standing in for a metered service call).
+ * Everything is real on-chain (deposit, just-in-time withdrawal, payment — a USDC
+ * transfer standing in for a metered service call).
  */
-import { createPublicClient, createWalletClient, http, formatUnits, parseUnits, getAddress } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
+import { formatUnits, getAddress } from 'viem'
 import { chain } from '../chain'
-import { config, explorerTx } from '../config'
-import { MorphoVaultProvider } from '../earn/MorphoVaultProvider'
-import { TransferPaymentLeg } from '../pay/TransferPaymentLeg'
-import { AutoInvestAgent, type Snapshot } from '../agent/AutoInvestAgent'
+import { config, explorerTx, validatePolicy } from '../config'
+import { buildContext, buildAgent, policyAmounts } from '../agent/build'
 import { appendEvent } from '../events'
+import type { Snapshot } from '../agent/AutoInvestAgent'
 
 const D = 6
 const usdc = (n: bigint) => `${formatUnits(n, D)} USDC`
@@ -41,34 +40,27 @@ async function main() {
     console.error('PAYEE_ADDRESS is not set. Set any testnet address to receive the demo "service payment".')
     process.exit(1)
   }
+  const policyErrors = validatePolicy(config)
+  if (policyErrors.length) {
+    console.error('Invalid policy config:\n - ' + policyErrors.join('\n - '))
+    process.exit(1)
+  }
 
-  const publicClient = createPublicClient({ chain, transport: http(config.rpcUrl) })
-  const account = privateKeyToAccount(
-    config.privateKey.startsWith('0x') ? (config.privateKey as `0x${string}`) : (`0x${config.privateKey}` as `0x${string}`),
-  )
-  const walletClient = createWalletClient({ account, chain, transport: http(config.rpcUrl) })
-
-  const usdcAddr = getAddress(config.usdcAddress)
-  const vaultAddr = getAddress(config.vaultAddress)
+  const ctx = buildContext()
   const payee = getAddress(config.payeeAddress)
-  const buffer = parseUnits(config.bufferUsdc, D)
-  const lowWater = parseUnits(config.lowWaterUsdc, D)
-  const taskCost = parseUnits(config.taskCostUsdc, D)
-  const gasReserve = parseUnits(config.gasReserveUsdc, D)
+  const agent = buildAgent(ctx, payee)
+  const a = policyAmounts()
+  const taskCost = a.taskCost
   const tasks = config.demoTasks
 
   console.log('=== Auto-Invest Agent — demo ===')
   console.log(`Chain:  ${chain.name} (${chain.id})`)
-  console.log(`Agent:  ${account.address}`)
-  console.log(`Vault:  ${vaultAddr}`)
+  console.log(`Agent:  ${ctx.account.address}`)
+  console.log(`Vault:  ${ctx.vault}`)
   console.log(`Payee:  ${payee}`)
-  console.log(`Policy: ${config.bufferTasks}-task buffer (~${usdc(buffer)}); each task ~${usdc(taskCost)} + ~${usdc(gasReserve)} gas; refill from vault when liquid < ${config.lowWaterTasks} tasks (~${usdc(lowWater)})\n`)
+  console.log(`Policy: ${config.bufferTasks}-task buffer (~${usdc(a.buffer)}); each task ~${usdc(taskCost)} + ~${usdc(a.gasReserve)} gas; refill from vault when liquid < ${config.lowWaterTasks} tasks (~${usdc(a.lowWater)})\n`)
 
-  const earn = new MorphoVaultProvider({ publicClient, walletClient, account, vaultAddress: vaultAddr, usdcAddress: usdcAddr })
-  const pay = new TransferPaymentLeg({ publicClient, walletClient, account, usdcAddress: usdcAddr, payee })
-  const agent = new AutoInvestAgent({ publicClient, account, usdcAddress: usdcAddr, earn, pay, bufferUSDC: buffer, lowWaterUSDC: lowWater, gasReserveUSDC: gasReserve })
-
-  const nativeBal = await publicClient.getBalance({ address: account.address })
+  const nativeBal = await ctx.publicClient.getBalance({ address: ctx.account.address })
   if (nativeBal === 0n) {
     console.error('Native (gas) balance is 0 — fund from https://faucet.circle.com (gas is paid in USDC on Arc).')
     process.exit(1)
@@ -90,7 +82,7 @@ async function main() {
     console.log(`  invested ${usdc(swept.swept)}  →  ${explorerTx(swept.txHash!)}`)
     appendEvent({ type: 'sweep', amountUSDC: formatUnits(swept.swept, D), txHash: swept.txHash!, at: Date.now() })
   } else {
-    console.log('  nothing to sweep (liquid already at/below buffer)')
+    console.log('  nothing to sweep (liquid already at/below buffer, or below the dust threshold)')
   }
   showSnapshot('after sweep:', await agent.snapshot())
 

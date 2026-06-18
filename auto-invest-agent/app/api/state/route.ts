@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server'
 import { createPublicClient, http, formatUnits, getAddress } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
 import { chain } from '../../../src/chain'
 import { config } from '../../../src/config'
+import { loadAccount } from '../../../src/lib/account'
 import { erc20Abi } from '../../../src/abi/erc20'
 import { erc4626Abi } from '../../../src/abi/erc4626'
 
@@ -12,9 +12,9 @@ export const dynamic = 'force-dynamic'
 export const fetchCache = 'force-no-store'
 
 function agentAddress(): `0x${string}` {
+  // Prefer an explicit address so the web server needn't touch the private key.
   if (config.agentAddress) return getAddress(config.agentAddress)
-  const k = config.privateKey.startsWith('0x') ? config.privateKey : `0x${config.privateKey}`
-  return privateKeyToAccount(k as `0x${string}`).address
+  return loadAccount(config.privateKey).address
 }
 
 export async function GET() {

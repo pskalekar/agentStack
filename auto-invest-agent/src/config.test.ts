@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { derivePolicy } from './config'
+import { derivePolicy, validatePolicy } from './config'
 
 describe('derivePolicy', () => {
   it('sizes buffer and low-water as task-counts of (task + gas)', () => {
@@ -18,5 +18,28 @@ describe('derivePolicy', () => {
   it('renders cleanly despite float drift (0.3 × 3 = 0.8999… in float)', () => {
     const p = derivePolicy('0.3', '0', 3, 1)
     expect(p.bufferUsdc).toBe('0.900000')
+  })
+})
+
+describe('validatePolicy', () => {
+  const ok = { taskCostUsdc: '0.1', gasReserveUsdc: '0.01', bufferUsdc: '1.1', lowWaterUsdc: '0.55' }
+
+  it('accepts a sane policy', () => {
+    expect(validatePolicy(ok)).toEqual([])
+  })
+
+  it('rejects low-water above buffer', () => {
+    const errs = validatePolicy({ ...ok, bufferUsdc: '0.4', lowWaterUsdc: '0.55' })
+    expect(errs.join(' ')).toMatch(/low-water.*<= buffer/i)
+  })
+
+  it('rejects low-water that cannot cover one task + gas', () => {
+    const errs = validatePolicy({ ...ok, lowWaterUsdc: '0.05' }) // < 0.1 + 0.01
+    expect(errs.join(' ')).toMatch(/cover one task \+ gas/i)
+  })
+
+  it('rejects a zero task cost', () => {
+    const errs = validatePolicy({ ...ok, taskCostUsdc: '0' })
+    expect(errs.join(' ')).toMatch(/TASK_COST_USDC must be > 0/i)
   })
 })

@@ -20,6 +20,11 @@ export interface AutoInvestAgentOpts {
    * always retains this much to cover the next transaction's fee.
    */
   gasReserveUSDC: bigint
+  /**
+   * Minimum idle amount worth sweeping, in base units. Below this, a deposit's
+   * gas would rival the amount invested, so we skip it.
+   */
+  minSweepUSDC: bigint
 }
 
 export interface Snapshot {
@@ -48,6 +53,7 @@ export class AutoInvestAgent {
   private readonly buffer: bigint
   private readonly lowWater: bigint
   private readonly gasReserve: bigint
+  private readonly minSweep: bigint
 
   constructor(o: AutoInvestAgentOpts) {
     this.pub = o.publicClient
@@ -58,6 +64,7 @@ export class AutoInvestAgent {
     this.buffer = o.bufferUSDC
     this.lowWater = o.lowWaterUSDC
     this.gasReserve = o.gasReserveUSDC
+    this.minSweep = o.minSweepUSDC
   }
 
   async liquid(): Promise<bigint> {
@@ -71,11 +78,14 @@ export class AutoInvestAgent {
     return { liquid, invested: position.currentValue, shares: position.shares }
   }
 
-  /** Invest any liquid USDC above the buffer. No-op if at or below buffer. */
+  /**
+   * Invest liquid USDC above the buffer. No-op if at/below the buffer, or if the
+   * excess is below `minSweep` (too small to be worth a deposit tx's gas).
+   */
   async sweepIdle(): Promise<{ swept: bigint; txHash?: Hash }> {
     const liquid = await this.liquid()
-    if (liquid <= this.buffer) return { swept: 0n }
     const excess = liquid - this.buffer
+    if (excess <= 0n || excess < this.minSweep) return { swept: 0n }
     const { txHash } = await this.earn.deposit(excess)
     return { swept: excess, txHash }
   }

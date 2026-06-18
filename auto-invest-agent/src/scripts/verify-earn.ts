@@ -7,7 +7,7 @@
  *  - Key set + funded       -> deposit -> position grows -> withdraw -> funds return.
  */
 import { createPublicClient, createWalletClient, http, formatUnits, parseUnits, getAddress } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
+import { loadAccount } from '../lib/account'
 import { chain } from '../chain'
 import { config, explorerTx } from '../config'
 import { erc20Abi } from '../abi/erc20'
@@ -59,9 +59,7 @@ async function main() {
     return
   }
 
-  const account = privateKeyToAccount(
-    config.privateKey.startsWith('0x') ? (config.privateKey as `0x${string}`) : (`0x${config.privateKey}` as `0x${string}`),
-  )
+  const account = loadAccount(config.privateKey)
   const walletClient = createWalletClient({ account, chain, transport: http(config.rpcUrl) })
   console.log(`\nAccount: ${account.address}`)
 

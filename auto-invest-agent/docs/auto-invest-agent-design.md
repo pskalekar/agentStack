@@ -281,6 +281,20 @@ Implementation note: Next.js patches global `fetch` with caching, and viem's RPC
 or the dashboard shows stale balances. Realized yield is intentionally **not** shown as a headline
 number (see §3.3): on a test vault that doesn't accrue, it would read ~0, and we don't fabricate.
 
+### 5.5 Continuous mode
+
+`npm run demo` is a one-shot; `npm run agent` is the long-running version — a loop that
+**every `TICK_SECONDS`** sweeps idle funds and (every `TASK_EVERY_TICKS` ticks) pays a task. The
+sweep-each-tick is what makes investment *continuous*: USDC wired to the agent gets invested on
+the next tick, not only when a task happens (≤ `TICK_SECONDS` latency, since it polls rather than
+subscribing to deposit events). The tick's decision logic lives in a pure, unit-tested `runTick`.
+
+Two safeguards make the loop robust to slow/stuck transactions on testnet:
+- **`confirm()` timeout** — `waitForTransactionReceipt` waits indefinitely by default, so a stuck
+  tx would hang the agent forever; a timeout turns it into a retryable error instead.
+- **Pending-nonce guard** — before acting, the loop compares the latest vs. pending nonce; if a
+  tx is still in flight it skips the tick rather than queuing behind it or double-submitting.
+
 ---
 
 ## 6. Configuration

@@ -25,6 +25,22 @@ export function derivePolicy(taskCost: string, gasPerTask: string, bufTasks: num
   }
 }
 
+/** Validate the policy invariants the agent logic relies on. Returns problems. */
+export function validatePolicy(p: {
+  taskCostUsdc: string; gasReserveUsdc: string; bufferUsdc: string; lowWaterUsdc: string
+}): string[] {
+  const task = Number(p.taskCostUsdc)
+  const gas = Number(p.gasReserveUsdc)
+  const buffer = Number(p.bufferUsdc)
+  const low = Number(p.lowWaterUsdc)
+  const errs: string[] = []
+  if (!(task > 0)) errs.push(`TASK_COST_USDC must be > 0 (got ${p.taskCostUsdc})`)
+  if (gas < 0) errs.push(`GAS_PER_TASK_USDC must be >= 0 (got ${p.gasReserveUsdc})`)
+  if (low > buffer) errs.push(`low-water (${p.lowWaterUsdc}) must be <= buffer (${p.bufferUsdc}); raise BUFFER_TASKS or lower LOW_WATER_TASKS`)
+  if (low < task + gas) errs.push(`low-water (${p.lowWaterUsdc}) must cover one task + gas (${(task + gas).toFixed(6)}); raise LOW_WATER_TASKS`)
+  return errs
+}
+
 const { perTaskUsdc, bufferUsdc, lowWaterUsdc } = derivePolicy(taskCostUsdc, gasPerTaskUsdc, bufferTasks, lowWaterTasks)
 
 export const config = {
@@ -44,7 +60,11 @@ export const config = {
   bufferUsdc, // derived: bufferTasks × per-task
   lowWaterUsdc, // derived: lowWaterTasks × per-task
   gasReserveUsdc: gasPerTaskUsdc, // pay-time gas floor (= one task's gas)
+  // Don't sweep idle USDC smaller than this — avoids deposit txs whose gas
+  // exceeds the amount invested. Defaults to one task's worth.
+  minSweepUsdc: opt('MIN_SWEEP_USDC', taskCostUsdc),
   tickSeconds: Number(opt('TICK_SECONDS', '15')),
+  taskEveryTicks: Number(opt('TASK_EVERY_TICKS', '3')), // continuous mode: a task every N ticks (0 = sweep only)
 
   // --- verify-earn ---
   verifyAmountUsdc: opt('VERIFY_AMOUNT_USDC', '0.1'),

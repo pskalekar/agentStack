@@ -28,7 +28,7 @@ class FakePay implements PaymentLeg {
   }
 }
 
-function makeAgent(c: Chain, opts?: { buffer?: string; lowWater?: string; gasReserve?: string }) {
+function makeAgent(c: Chain, opts?: { buffer?: string; lowWater?: string; gasReserve?: string; minSweep?: string }) {
   const pub = { readContract: async () => c.liquid } as unknown as PublicClient
   const account = { address: '0xagent' } as unknown as Account
   const earn = new FakeVault(c)
@@ -42,6 +42,7 @@ function makeAgent(c: Chain, opts?: { buffer?: string; lowWater?: string; gasRes
     bufferUSDC: U(opts?.buffer ?? '1.1'),
     lowWaterUSDC: U(opts?.lowWater ?? '0.55'),
     gasReserveUSDC: U(opts?.gasReserve ?? '0.01'),
+    minSweepUSDC: U(opts?.minSweep ?? '0'),
   })
   return { agent, earn, pay, c }
 }
@@ -69,6 +70,19 @@ describe('AutoInvestAgent.sweepIdle', () => {
     expect(r.swept).toBe(0n)
     expect(c.vault).toBe(0n)
   })
+
+  it('does NOT sweep dust below the minimum (gas would rival the amount)', async () => {
+    const { agent, c } = makeAgent({ liquid: U('1.6'), vault: 0n }, { minSweep: '1' }) // excess 0.5 < 1
+    const r = await agent.sweepIdle()
+    expect(r.swept).toBe(0n)
+    expect(c.vault).toBe(0n)
+  })
+
+  it('sweeps when the excess meets the minimum', async () => {
+    const { agent } = makeAgent({ liquid: U('3'), vault: 0n }, { minSweep: '1' }) // excess 1.9 >= 1
+    const r = await agent.sweepIdle()
+    expect(r.swept).toBe(U('1.9'))
+  })
 })
 
 describe('AutoInvestAgent.payForTask', () => {
@@ -86,6 +100,14 @@ describe('AutoInvestAgent.payForTask', () => {
     const r = await agent.payForTask(U('0.1'))
     expect(r.refilled).toBe(0n)
     expect(c.liquid).toBe(U('0.45'))
+  })
+
+  it('pays from buffer without refilling in the mid-range (low-water < liquid < buffer)', async () => {
+    const { agent, c } = makeAgent({ liquid: U('0.8'), vault: U('10') }) // 0.55 < 0.8 < 1.1
+    const r = await agent.payForTask(U('0.1'))
+    expect(r.refilled).toBe(0n)
+    expect(c.liquid).toBe(U('0.7'))
+    expect(c.vault).toBe(U('10'))
   })
 
   it('refills back up to the buffer when liquid drops below low-water', async () => {

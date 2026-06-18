@@ -7,6 +7,7 @@
   "scripts": {
     "verify-earn": "tsx src/scripts/verify-earn.ts",
     "demo": "tsx src/scripts/demo.ts",
+    "agent": "tsx src/scripts/agent.ts",
     "dashboard": "next dev -p 3007",
     "build:dashboard": "next build",
     "start:dashboard": "next start -p 3007",
